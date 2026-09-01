@@ -20,20 +20,27 @@ from dataclasses import dataclass
 IS_MACOS = sys.platform == "darwin"
 
 _TERMINALS = {
-    "Apple_Terminal": "Terminal",
-    "iTerm.app": "iTerm",
-    "vscode": "Visual Studio Code (ou Code Helper)",
-    "WarpTerminal": "Warp",
-    "Hyper": "Hyper",
-    "ghostty": "Ghostty",
-    "WezTerm": "WezTerm",
-    "alacritty": "Alacritty",
+    "Apple_Terminal": ("Terminal", "/System/Applications/Utilities/Terminal.app"),
+    "iTerm.app": ("iTerm", "/Applications/iTerm.app"),
+    "vscode": ("Visual Studio Code", "/Applications/Visual Studio Code.app"),
+    "WarpTerminal": ("Warp", "/Applications/Warp.app"),
+    "Hyper": ("Hyper", "/Applications/Hyper.app"),
+    "ghostty": ("Ghostty", "/Applications/Ghostty.app"),
+    "WezTerm": ("WezTerm", "/Applications/WezTerm.app"),
+    "alacritty": ("Alacritty", "/Applications/Alacritty.app"),
 }
 
 
 def host_app() -> str:
     """O app que precisa receber a permissão — não é o Python."""
-    return _TERMINALS.get(os.environ.get("TERM_PROGRAM", ""), "o seu aplicativo de terminal")
+    entrada = _TERMINALS.get(os.environ.get("TERM_PROGRAM", ""))
+    return entrada[0] if entrada else "o seu aplicativo de terminal"
+
+
+def host_app_path() -> str | None:
+    """Caminho do app, para adicionar à mão quando ele não aparece na lista."""
+    entrada = _TERMINALS.get(os.environ.get("TERM_PROGRAM", ""))
+    return entrada[1] if entrada else None
 
 
 @dataclass(frozen=True)
@@ -52,8 +59,8 @@ def check_input_monitoring() -> PermissionStatus:
     """Monitoramento de Entrada — necessário para o atalho global."""
     path = "Ajustes do Sistema › Privacidade e Segurança › Monitoramento de Entrada"
     hint = (
-        f"Adicione e ative {host_app()} nessa lista e "
-        "reinicie o terminal — a permissão só vale a partir do próximo processo."
+        f"Ative {host_app()} nessa lista e reinicie o terminal — "
+        "a permissão só vale a partir do próximo processo."
     )
     if not IS_MACOS:
         return PermissionStatus("Monitoramento de Entrada", None, path, "só se aplica ao macOS")
@@ -101,6 +108,36 @@ def check_microphone() -> PermissionStatus:
         return PermissionStatus("Microfone", None, path, "ainda não foi pedida — será pedida na primeira captura")
     except Exception:
         return PermissionStatus("Microfone", None, path, hint)
+
+
+def manual_instructions() -> str:
+    """A lista do macOS nasce vazia: um app só aparece nela depois de pedir a
+    permissão pelo menos uma vez. Quem chega antes disso encontra "Nenhum Item"
+    e acha que instalou algo errado."""
+    caminho = host_app_path()
+    linhas = [
+        "A lista de Monitoramento de Entrada começa vazia — um app só aparece",
+        "nela depois de pedir a permissão. Dois caminhos:",
+        "",
+        "  1. Rode `python -m eve`. Ele dispara o pedido, o macOS mostra o",
+        "     diálogo e o seu terminal passa a aparecer na lista.",
+        "",
+        "  2. Ou adicione à mão: clique no + , aperte Cmd+Shift+G e cole",
+    ]
+    if caminho:
+        linhas.append(f"     {caminho}")
+    else:
+        linhas += [
+            "     o caminho do seu terminal, por exemplo:",
+            "     /System/Applications/Utilities/Terminal.app   (Terminal)",
+            "     /Applications/iTerm.app                       (iTerm)",
+        ]
+    linhas += [
+        "",
+        "Nos dois casos: ative o interruptor e depois FECHE E REABRA o terminal.",
+        "A permissão só vale a partir do próximo processo.",
+    ]
+    return "\n".join(linhas)
 
 
 def report() -> list[PermissionStatus]:

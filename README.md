@@ -25,6 +25,7 @@ a `libportaudio.dylib` embutida.
 python -m eve                     # inicia a EVE
 python -m eve.apps.cli devices    # lista os dispositivos de áudio
 python -m eve.apps.cli doctor     # checa dependências, permissões e devices
+python -m eve.apps.cli permissions # pede a permissão de teclado (macOS)
 ```
 
 Segure `CTRL+SPACE`, fale, solte. Você ouve a própria gravação e vê o turno:
@@ -50,6 +51,25 @@ Warp), nunca ao binário do Python — e **só valem depois de reiniciar o termi
 | Microfone | Ajustes › Privacidade e Segurança › Microfone | A captura devolve silêncio digital |
 
 `python -m eve.apps.cli doctor` diz o que está faltando.
+
+### "A lista de Monitoramento de Entrada está vazia"
+
+É o normal. **Um app só aparece nessa lista depois de pedir a permissão.**
+Rode `python -m eve.apps.cli permissions`: ele dispara o pedido e o seu terminal
+passa a aparecer lá. Ou adicione à mão — clique no `+`, aperte `Cmd+Shift+G` e
+cole o caminho do seu terminal:
+
+| Terminal | Caminho |
+|---|---|
+| Terminal | `/System/Applications/Utilities/Terminal.app` |
+| iTerm | `/Applications/iTerm.app` |
+| VS Code | `/Applications/Visual Studio Code.app` |
+| Warp | `/Applications/Warp.app` |
+
+Dos dois jeitos: ative o interruptor e **feche e reabra o terminal**.
+
+Se o macOS não mostrar o diálogo, é porque ele só pergunta uma vez por app —
+`tccutil reset ListenEvent` reseta e faz ele perguntar de novo.
 
 ## `ctrl+space` no macOS
 

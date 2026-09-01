@@ -3,6 +3,7 @@
     python -m eve                       inicia (equivale a `run`)
     python -m eve.apps.cli devices      lista dispositivos de áudio
     python -m eve.apps.cli doctor       checa dependências e permissões
+    python -m eve.apps.cli permissions  pede a permissão de teclado (macOS)
 """
 
 from __future__ import annotations
@@ -71,6 +72,9 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     if permissions.IS_MACOS:
         print(permissions.render_report())
         print()
+        if permissions.check_input_monitoring().granted is not True:
+            print(permissions.manual_instructions())
+            print()
     else:
         print(f"Sistema: {sys.platform} — as checagens de permissão são específicas do macOS.\n")
 
@@ -89,6 +93,27 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# ------------------------------------------------------------ permissions ----
+
+def cmd_permissions(_: argparse.Namespace) -> int:
+    from eve.client import permissions
+
+    if not permissions.IS_MACOS:
+        print(f"Sistema {sys.platform}: nada a conceder.")
+        return 0
+
+    status = permissions.check_input_monitoring()
+    if status.granted is True:
+        print("Monitoramento de Entrada: já concedida. Nada a fazer.")
+        return 0
+
+    print("Monitoramento de Entrada: ainda não concedida.\n")
+    print("Abrindo o diálogo do sistema — clique em Abrir Ajustes do Sistema...\n")
+    permissions.request_input_monitoring()
+    print(permissions.manual_instructions())
+    return 0
+
+
 # -------------------------------------------------------------------- run ----
 
 def _preflight(cfg: Config) -> bool:
@@ -105,12 +130,10 @@ def _preflight(cfg: Config) -> bool:
     print("O atalho global não vai funcionar: falta permissão.\n")
     print(f"  {status.settings_path}")
     print(f"  {status.hint}\n")
-    print("Abrindo o diálogo do sistema...")
+    print("Abrindo o diálogo do sistema...\n")
     permissions.request_input_monitoring()
-    print(
-        "\nConceda a permissão, feche e reabra "
-        f"{permissions.host_app()}, e rode `python -m eve` de novo."
-    )
+    print(permissions.manual_instructions())
+    print(f"\nDepois rode `python -m eve` de novo.")
     return False
 
 
@@ -233,6 +256,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("run", help="inicia a EVE (padrão)").set_defaults(func=cmd_run)
     sub.add_parser("devices", help="lista os dispositivos de áudio").set_defaults(func=cmd_devices)
     sub.add_parser("doctor", help="checa dependências e permissões").set_defaults(func=cmd_doctor)
+    sub.add_parser(
+        "permissions", help="pede a permissão de Monitoramento de Entrada (macOS)"
+    ).set_defaults(func=cmd_permissions)
     return parser
 
 
