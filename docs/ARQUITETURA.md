@@ -1,291 +1,361 @@
-# EVE — Arquitetura (Fase 1: validação de experiência no PC)
+# EVE — Arquitetura (Fase 1: MVP push-to-talk, 100% API, Windows 11)
 
-> Documento de decisão. Nada implementado ainda. Objetivo desta fase: **descobrir se conversar com o EVE é bom**, não construir hardware.
+> Documento de decisão, v2. Nada implementado ainda.
+> Objetivo desta fase: **fazer `tecla → fala → resposta em voz natural` ficar excelente**, gastando o mínimo possível, sem comprar nada.
 
 ---
 
-## 1. TL;DR das decisões
+## 0. O que mudou da v1
+
+| | v1 | v2 |
+|---|---|---|
+| Hardware | pressupunha fones | **microfone e alto-falante do próprio PC, nada externo** |
+| Modelos locais | faster-whisper, Piper, openWakeWord como opções | **removidos da Fase 1** — tudo via API |
+| LLM | SDK Anthropic direto | **OpenRouter** (superfície compatível com OpenAI) |
+| Entrada de voz | wake word + VAD desde o M2 | **push-to-talk no MVP**; wake word/VAD viram Fase 2 |
+| Eco / AEC | risco nº 2, mitigado com fones | **dissolvido pelo push-to-talk** (§4) |
+| SO | genérico | **Windows 11**, com o que isso implica (§9) |
+| Custo | não era seção | **seção própria (§12)** — "gastar o mínimo" virou requisito de projeto |
+
+O que **não** mudou: a separação Voice Client / EVE Core, os contratos streaming, a separação memória × personalidade e a regra de que a fronteira do dispositivo existe no código desde o primeiro dia.
+
+---
+
+## 1. Decisões
 
 | Decisão | Escolha | Por quê |
 |---|---|---|
-| Linguagem | Python 3.11+ / asyncio | Único ecossistema com áudio + wake word + STT local + todos os SDKs maduros |
-| Modelo de conversa | Pipeline em cascata streaming (STT→LLM→TTS) | Speech-to-speech monolítico é mais rápido mas amarra você a um fornecedor — mata o requisito de trocar provider |
-| Fronteira cliente/servidor | Definida agora, executada em um processo só | `Transport` é um adaptador; virar 2 processos é flag de config, não reescrita |
-| Wake word / VAD | Sempre no cliente, sempre local | Se a decisão de "quando ouvir" depender da rede, o dispositivo fica burro e caro |
-| LLM | `claude-opus-5`, streaming, fast mode, effort baixo, prompt cache | Melhor uso de ferramentas; fast mode dá até 2.5x mais tokens/s — importante para voz |
-| Tools | Registry nativo + ponte MCP | MCP evita inventar formato de plugin; dispositivos futuros entram sem código novo |
-| Memória | SQLite + sqlite-vec, escrita fora do caminho crítico | Latência zero no turno; dado do usuário separado do código |
-| Personalidade | Arquivos YAML/Markdown versionados no git | Ciclo de vida diferente da memória: um é entrada do sistema, o outro é dado pessoal |
-| AEC (eco) | Fones na Fase 1, interface pronta para WebRTC APM depois | É o problema mais subestimado de assistente de voz; não vale queimar as primeiras semanas nele |
+| Linguagem | Python 3.11+ / asyncio | Áudio, SDKs e HTTP streaming no mesmo lugar; roda bem em Windows |
+| Interação | **Push-to-talk** (segurar tecla) | Elimina wake word, VAD, endpointing e eco de uma vez só |
+| Modelo de conversa | Cascata: STT → LLM → TTS | Requisito de trocar provider por configuração |
+| STT | **Batch** (áudio completo no release) | PTT te dá o fim da fala de graça; streaming vira otimização do M2 |
+| LLM → TTS | **Streaming obrigatório** | É o único ponto onde streaming é inegociável no MVP |
+| LLM | OpenRouter, default `anthropic/claude-haiku-4.5` | Um endpoint, muitos modelos, troca por config; Haiku tem o menor TTFT útil |
+| TTS | Azure Neural pt-BR (free tier) ou ElevenLabs Flash | Tensão real entre "natural" e "barato" — resolvida em §11 |
+| Fronteira | Voice Client / EVE Core, um processo só | Conceitual agora, dois processos depois, sem reescrita |
+| Eco / AEC | Fora do caminho crítico | PTT resolve; AEC volta quando entrar hands-free |
+| Memória | Interface agora, implementação no M3 | Costura pronta, sem construir o que você ainda não precisa |
 
 ---
 
-## 2. Análise e premissas
+## 2. Premissas da Fase 1
 
-O repositório está vazio — é greenfield. As restrições reais que moldam o desenho vêm do seu enunciado:
-
-1. **"Streaming e baixa latência desde o início"** — isso é uma restrição de arquitetura, não uma otimização. Um sistema desenhado com chamadas request/response não vira streaming depois; você o reescreve. Todo contrato entre camadas é um `AsyncIterator`.
-2. **"Preparada para separar cliente de servidor"** — a fronteira precisa existir no código desde já, mesmo rodando num processo. Se não existir, ela nunca aparece.
-3. **"Trocar provider sem reescrever"** — interface não basta. O que garante isso é uma **suíte de testes de contrato** que toda implementação precisa passar.
-4. **"Memória separada da personalidade"** — decisão certa e frequentemente ignorada. Detalho na seção 12.
-5. **"Terminal primeiro, sem GUI/hardware"** — correto. A GUI esconde latência e a latência é justamente o que você quer sentir.
+1. **Nenhum hardware novo.** Microfone integrado (ou o que já estiver plugado) e alto-falantes do PC. Windows 11.
+2. **Nenhum modelo local.** Sem GPU no orçamento, sem download de pesos, sem CUDA. Tudo API.
+3. **Custo mínimo.** O sistema precisa custar poucos dólares por mês em uso pessoal, e isso é uma restrição de projeto — não um detalhe operacional.
+4. **Terminal, sem GUI.** A interface é uma tecla e o alto-falante.
+5. **Uma pessoa, uma máquina.** Sem multiusuário, sem autenticação, sem deploy.
 
 ---
 
-## 3. A decisão central: cascata vs. speech-to-speech
+## 3. O MVP, em uma frase
 
-Existem dois caminhos hoje e eles levam a arquiteturas incompatíveis.
+> Seguro uma tecla → falo → solto → a EVE entende, pensa e responde em voz natural pelo alto-falante.
 
-**A) Speech-to-speech nativo** (APIs realtime que recebem áudio e devolvem áudio, sem texto no meio).
-- ✅ Latência de ~300–600ms, turn-taking natural, entonação preserva emoção da sua fala.
-- ❌ Um único fornecedor faz STT+LLM+TTS. Você não troca peça: troca o sistema inteiro.
-- ❌ Controle fraco sobre tools, memória e prompt. Difícil de rodar local. Caro por minuto de áudio.
+Nada além disso entra na Fase 1. O sucesso é medido por duas perguntas:
 
-**B) Cascata com streaming em cada estágio.**
-- ✅ Cada camada é trocável. Roda local se você quiser. Controle total de tools/memória/persona.
-- ✅ Você vê o texto — dá para debugar, logar, testar, medir.
-- ❌ ~800ms–1.5s até o primeiro som se bem feito (e 3s+ se mal feito).
+- **É rápido?** Menos de ~1,5 s entre soltar a tecla e ouvir o primeiro som.
+- **É bom de conversar?** A voz soa natural, as respostas são curtas, e você não fica repetindo porque ela não entendeu.
 
-**Recomendação: B.** Seus dois requisitos explícitos — trocar providers e ter tools/memória próprias — são exatamente o que A destrói. A diferença de latência é real mas administrável (seção 8).
-
-**Mitigação inteligente:** o orquestrador conversa com uma interface `ConversationEngine`, não com STT/LLM/TTS diretamente. Existem duas implementações possíveis: `CascadeEngine` (composta pelas três camadas) e, no futuro, `RealtimeEngine` (um provider speech-to-speech inteiro). Assim você pode testar A depois sem tocar no orquestrador, nas tools ou na memória. Não construa `RealtimeEngine` agora — só deixe o encaixe.
+Se as duas forem "sim", o projeto está provado e o resto é expansão. Se qualquer uma for "não", nenhuma feature adicional salva.
 
 ---
 
-## 4. Blocos
+## 4. Por que push-to-talk primeiro — e o que ele resolve de graça
+
+Você propôs PTT para reduzir complexidade. Ele faz mais que isso: **elimina quatro problemas de uma vez**, e três deles eram os principais riscos da v1.
+
+| Problema | Como o PTT resolve |
+|---|---|
+| **Eco acústico (AEC)** | O microfone só abre enquanto você segura a tecla. A EVE nunca ouve a si mesma. O problema não é adiado — ele não existe no MVP. |
+| **Endpointing** (o assistente te cortar no meio da frase) | Você decide quando terminou. Zero ambiguidade, zero ajuste de silêncio, zero frustração. Era o risco nº 1 da v1. |
+| **Falso positivo de wake word** | Não há wake word. A EVE nunca acorda sozinha. |
+| **Barge-in** | Apertar a tecla enquanto ela fala corta o áudio na hora. Interrupção determinística, sem detecção de voz, sem falso positivo. |
+
+O custo dessa escolha é uma coisa só: não é hands-free. Para validar a experiência conversacional no PC, isso não importa.
+
+**Consequência de projeto:** o AEC não é "adiado com risco". Ele passa a ser um requisito da Fase 2, que só aparece junto com wake word e VAD — as três coisas que criam a necessidade dele. É a ordem certa.
+
+---
+
+## 5. Blocos: Voice Client e EVE Core
 
 ```
-┌─────────────────── CLIENTE (vira dispositivo depois) ───────────────────┐
-│  Microfone → Ring Buffer → AEC → VAD → Wake Word                        │
-│  Alto-falante ← Jitter Buffer ←──────────────────────────────┐          │
-└────────────────────────────┬─────────────────────────────────┼──────────┘
-                             │ Transport (in-process hoje, WebSocket depois)
-                             │ áudio PCM16 20ms + eventos JSON
-┌────────────────────────────▼─────────────────────────────────┼──────────┐
-│                      SERVIDOR DE IA                          │          │
-│                                                              │          │
-│   STT (streaming) ──parciais/final──► ORQUESTRADOR ──texto──► TTS ──────┘
-│                                            │  ▲   (streaming) (streaming)
-│                                            ▼  │                          │
-│                                       Agente LLM (streaming + tools)     │
-│                                            │  ▲                          │
-│                          ┌─────────────────┴──┴────────────────┐         │
-│                          │  Tool Registry  │  Memória  │ Persona│         │
-│                          │  nativas + MCP  │  SQLite   │  YAML  │         │
-│                          └─────────────────────────────────────┘         │
-└──────────────────────────────────────────────────────────────────────────┘
+┌───────── VOICE CLIENT (vira o dispositivo na Fase 3) ─────────┐
+│                                                                │
+│   Hotkey global ──► Captura (WASAPI, 16 kHz mono)             │
+│         │                      │                               │
+│         │ ptt_up               │ buffer PCM16 em RAM           │
+│         ▼                      ▼                               │
+│   Playback ◄──── Jitter buffer ◄──────────────────────┐        │
+└────────────────────────┬──────────────────────────────┼────────┘
+                         │  Transport                   │
+                         │  (filas asyncio hoje,        │
+                         │   WebSocket na Fase 2)       │
+┌────────────────────────▼──────────────────────────────┼────────┐
+│                      EVE CORE                         │        │
+│                                                       │        │
+│   STT (batch, HTTP) ──texto──► ORQUESTRADOR ──chunks──┴► TTS   │
+│                                     │  ▲                       │
+│                                     ▼  │                       │
+│                            Agente LLM (OpenRouter, streaming)  │
+│                                     │  ▲                       │
+│                        ┌────────────┴──┴────────────┐          │
+│                        │ Tools │ Memória │ Persona  │          │
+│                        └────────────────────────────┘          │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-Regra de fronteira: **tudo que precisa do microfone em tempo real fica no cliente** (captura, AEC, VAD, wake word, playback). Tudo que precisa de CPU/GPU/rede/chaves fica no servidor.
+**Regra de fronteira (inalterada da v1):** o que precisa do microfone e do alto-falante em tempo real fica no Voice Client. O que precisa de chaves de API, CPU ou estado fica no EVE Core.
+
+**O que cruza a fronteira:**
+
+| Direção | Evento | Payload |
+|---|---|---|
+| ↑ | `ptt_down` | — |
+| ↑ | `audio_chunk` | PCM16 mono 16 kHz, 20 ms |
+| ↑ | `ptt_up` | — (marca fim da fala) |
+| ↓ | `state` | `IDLE` \| `LISTENING` \| `THINKING` \| `SPEAKING` |
+| ↓ | `transcript` | o que a EVE entendeu (para o terminal) |
+| ↓ | `audio_out` | PCM16 mono 24 kHz |
+| ↓ | `speak_end` | — |
+
+São sete eventos. É esse contrato que vira WebSocket depois — e é por isso que ele precisa estar escrito agora, mesmo com os dois lados no mesmo processo.
 
 ---
 
-## 5. Contratos (o núcleo da arquitetura)
+## 6. Contratos
 
-Definidos como `typing.Protocol` — sem herança, sem framework de DI. Todos são assíncronos e streaming.
+`typing.Protocol`, sem herança nem framework. O que muda em relação à v1: `STTProvider` ganha um método batch (o caminho do MVP) e mantém o streaming como opcional para o M2.
 
 ```python
 class AudioSource(Protocol):
-    def frames(self) -> AsyncIterator[AudioFrame]: ...   # PCM16 mono 16k, 20ms
+    def frames(self) -> AsyncIterator[AudioFrame]: ...     # PCM16 mono 16k, 20 ms
 
 class AudioSink(Protocol):
     async def write(self, frame: AudioFrame) -> None: ...
-    async def flush(self) -> None: ...
-    async def stop(self) -> None: ...                    # descarta buffer (barge-in)
+    async def stop(self) -> None: ...                      # descarta o buffer (barge-in)
 
-class WakeWordDetector(Protocol):
-    def detect(self, frames: AsyncIterator[AudioFrame]) -> AsyncIterator[WakeEvent]: ...
-
-class VAD(Protocol):
-    def segment(self, frames: AsyncIterator[AudioFrame]) -> AsyncIterator[SpeechEvent]: ...
-    # SpeechEvent: SPEECH_START | SPEECH_END(confidence, silence_ms)
+class PushToTalk(Protocol):
+    def events(self) -> AsyncIterator[PTTEvent]: ...       # DOWN | UP
 
 class STTProvider(Protocol):
-    def transcribe(self, frames: AsyncIterator[AudioFrame]) -> AsyncIterator[Transcript]: ...
-    # Transcript(text, is_final, stability, ts)
+    async def transcribe(self, audio: bytes) -> Transcript: ...          # MVP
+    def transcribe_stream(self, frames) -> AsyncIterator[Transcript]: ... # M2, opcional
 
 class LLMProvider(Protocol):
     def respond(self, ctx: Context) -> AsyncIterator[LLMEvent]: ...
-    # LLMEvent: TextDelta | ToolCall | ToolResultNeeded | Done(usage)
+    # LLMEvent: TextDelta | ToolCall | Done(usage)
 
 class TTSProvider(Protocol):
     def synthesize(self, text: AsyncIterator[str]) -> AsyncIterator[AudioFrame]: ...
 
-class ConversationEngine(Protocol):
-    def run_turn(self, audio_in, audio_out, ctx) -> AsyncIterator[TurnEvent]: ...
+class MemoryStore(Protocol):
+    async def recall(self, query: str, k: int) -> list[Fact]: ...
+    async def remember(self, fact: Fact) -> None: ...
 ```
 
-Três invariantes que valem mais que o resto do documento:
+Invariantes que continuam valendo:
 
-1. **Nenhum método retorna uma lista completa.** Se retornasse, você teria embutido latência na assinatura.
-2. **Todo estágio aceita cancelamento** (`asyncio.CancelledError` limpo, sem deixar socket pendurado). Barge-in é cancelamento propagado da ponta ao servidor.
-3. **Todo estágio emite marcos de tempo** para o `TurnTrace`. Latência que você não mede, você não corrige.
+1. **`LLMProvider` e `TTSProvider` nunca devolvem tudo pronto.** Se devolvessem, você teria embutido latência na assinatura, e nenhuma otimização posterior a tira de lá.
+2. **Todo estágio aceita cancelamento** — `CancelledError` limpo, sem socket pendurado.
+3. **Todo estágio emite marcos de tempo** para o `TurnTrace` (§14).
+
+`STTProvider.transcribe` é `async` mas não streaming — e isso é deliberado. Com PTT você já tem o áudio completo; streaming ali resolveria um problema que você não tem.
 
 ---
 
-## 6. Orquestrador: máquina de estados
+## 7. Máquina de estados (versão PTT)
 
 ```
-        wake / push-to-talk
-IDLE ──────────────────────► LISTENING
- ▲                              │ VAD end-of-utterance
- │                              ▼
- │                          THINKING ──(tool call)──► TOOL_RUNNING
- │                              │  ◄─────────────────────┘
- │                              │ primeiro chunk de texto
- │                              ▼
- └──── fim do áudio ───────  SPEAKING
-                                │
-        fala do usuário durante SPEAKING → BARGE_IN → LISTENING
+         tecla pressionada
+IDLE ─────────────────────────► LISTENING
+ ▲                                  │ tecla solta
+ │                                  ▼
+ │                              THINKING ──(tool)──► TOOL_RUNNING
+ │                                  │  ◄──────────────────┘
+ │                                  │ 1º chunk de texto
+ │                                  ▼
+ └────── fim do áudio ─────────  SPEAKING
+                                    │
+     tecla pressionada durante SPEAKING
+     → corta o áudio, cancela LLM e TTS → LISTENING
 ```
 
-- **Barge-in** é obrigatório, não é enfeite: `audio_sink.stop()`, cancela o stream do TTS, cancela o stream do LLM, guarda a resposta parcial no histórico marcada como interrompida ("você foi interrompido depois de dizer X" — o modelo precisa saber disso ou repete tudo).
-- Turnos são **cancelável por construção**: cada turno é uma `asyncio.Task`; interromper é `task.cancel()`.
-- O orquestrador é a única peça que conhece o estado global. STT, LLM e TTS não sabem que existe uma conversa.
+Bem mais simples que a v1: sem `WAKE`, sem estados de detecção, sem timeout de falso positivo. Cinco estados, transições determinísticas, nenhuma delas dependente de heurística de áudio.
+
+Um detalhe que parece pequeno e não é: **ao ser interrompida, a EVE guarda a resposta parcial no histórico marcada como interrompida.** Sem isso, o modelo não sabe o que já saiu pelo alto-falante e repete tudo do começo na resposta seguinte.
 
 ---
 
-## 7. Orçamento de latência
+## 8. Latência
 
-Alvo do primeiro som depois que você para de falar:
+Alvo: tempo entre **soltar a tecla** e **ouvir o primeiro som**.
 
-| Etapa | Custo típico | Alavanca |
+| Etapa | Custo típico | Observação |
 |---|---|---|
-| VAD confirma fim de turno | **250–500ms** | **maior e mais controlável** |
-| STT devolve final | 80–200ms | provider; áudio já foi processado em streaming |
-| LLM primeiro token | 350–700ms | fast mode, effort baixo, cache de prompt |
-| Primeiro áudio do TTS | 80–150ms | provider + tamanho do primeiro chunk |
-| Buffer de playback | 50–100ms | tamanho do jitter buffer |
-| **Total** | **~0.8–1.5s** | |
+| Áudio já está em RAM | ~0 ms | PTT: nada a esperar |
+| Upload + STT batch (clipe de ~5 s) | 300–600 ms | Groq `whisper-large-v3-turbo` fica na ponta baixa |
+| LLM primeiro token | 350–700 ms | inclui ~30–80 ms do hop do OpenRouter |
+| Primeiro chunk de texto → primeiro áudio | 100–400 ms | ElevenLabs Flash ~100 ms; Azure/OpenAI 200–400 ms |
+| Buffer de playback | 50–100 ms | |
+| **Total** | **~0,85 – 1,8 s** | |
 
-Referência de percepção: abaixo de 800ms parece conversa; 1–2s é aceitável; acima de 2s a pessoa começa a falar por cima.
+Comparado com a v1 (0,8–1,5 s), o teto piorou um pouco: o STT batch substitui o streaming e o OpenRouter adiciona um salto. Em troca, **a variância despencou** — sumiram o endpointing errado, o wake word que não dispara e o que dispara sozinho. Assistente de voz é julgado pela variância, não pela mediana: um sistema que responde em 1,3 s sempre parece melhor que um que responde em 0,9 s na maior parte das vezes e te corta no meio da frase de vez em quando.
 
-Técnicas, em ordem de retorno:
+**Alavancas, em ordem de retorno:**
 
-1. **Endpointing adaptativo.** Silêncio de 200ms se o parcial termina em algo sintaticamente completo; 600–800ms se termina em hesitação ou conjunção ("e...", "tipo...", "então"). É aqui que se ganha meio segundo — mais do que em qualquer otimização de modelo.
-2. **Chunk por cláusula, com o primeiro curto.** Manda para o TTS na primeira vírgula/ponto ou aos ~40 caracteres; chunks seguintes maiores (150–200 chars) para a prosódia não ficar picotada. O primeiro chunk curto é o que derruba o tempo até o primeiro som.
-3. **Sockets quentes.** Conexões WebSocket com STT e TTS abertas e mantidas com keepalive. Handshake custa 100–300ms por turno se você reconectar.
-4. **Prompt caching.** Prefixo estável (tools → persona → perfil do usuário) cacheado; o retrieval volátil vai *depois* do breakpoint. Corta TTFT e custo.
+1. **Chunk por cláusula, com o primeiro curto.** Manda para o TTS na primeira vírgula ou aos ~40 caracteres; chunks seguintes maiores (150–200) para a prosódia não picotar. É a maior alavanca do MVP.
+2. **Conexão HTTP reaproveitada.** Um `httpx.AsyncClient` de vida longa por provider. Handshake TLS novo custa 100–300 ms por turno.
+3. **Peça PCM cru ao TTS**, não MP3 (§9). Elimina o decoder do caminho crítico e uma dependência.
+4. **Prompt curto e estável.** Persona + tools primeiro, contexto volátil depois — ajuda o cache do provider quando ele existe.
 5. **Nunca esperar o LLM terminar.** O TTS consome o stream de tokens.
-6. *(Opcional, medir depois)* **Execução especulativa**: disparar o LLM no parcial estável e cancelar se o final divergir. Ganha 200–400ms, custa tokens duplicados. Deixe atrás de uma flag.
+6. *(M2)* **Subir o áudio enquanto a tecla está pressionada**, para um STT streaming. O final chega ~100 ms depois do release em vez de 300–600 ms. Economiza 200–500 ms sem abandonar o PTT.
 
 ---
 
-## 8. Áudio, e o problema que todo mundo subestima
+## 9. Áudio no Windows 11 — detalhes que causam dor
 
-Com alto-falante aberto, o microfone ouve o próprio EVE. Consequências: o wake word dispara com a própria voz e o barge-in aciona sozinho. Isso é cancelamento de eco acústico (AEC), e é o problema mais chato do projeto inteiro.
+- **Captura e playback:** `sounddevice` (PortAudio) com backend WASAPI. Funciona bem no Windows 11 e não exige nada instalado além do pacote Python.
+- **Hotkey global:** `pynput` — funciona com o terminal fora de foco e **não exige privilégio de administrador** (diferente da biblioteca `keyboard`, que exige em vários cenários). Segurar-para-falar via listener de press/release. Vale ter um modo alternativo de alternância (aperta uma vez para começar, outra para parar) porque "segurar" em terminal às vezes conflita com atalhos do Windows.
+- **Peça PCM cru ao TTS.** ElevenLabs (`output_format=pcm_24000`), OpenAI (`response_format="pcm"`, 24 kHz 16-bit mono) e Azure (`Raw24Khz16BitMonoPcm`) devolvem PCM direto. Isso remove um decoder de MP3 do caminho crítico e evita depender de `ffmpeg`/`pyav` no Windows, que é onde a instalação costuma quebrar.
+- **Escolha o dispositivo explicitamente.** Windows troca o default sozinho quando você pluga qualquer coisa. Fixe o índice do device na config e logue qual foi aberto.
+- **Formatos fixos:** captura em 16 kHz mono PCM16, playback em 24 kHz mono PCM16. Resample no cliente, nunca no core.
+- **Captura em thread separada** alimentando o event loop por fila. Callback de áudio bloqueia e não pode competir com o asyncio.
 
-Opções:
-
-1. **Fones na Fase 1.** O problema some e você valida a experiência conversacional, que é o objetivo declarado. **Recomendado para M0–M3.**
-2. **WebRTC APM / speexdsp** com o sinal de playback como referência. Funciona, mas exige captura e playback no mesmo clock de dispositivo — com devices diferentes o drift de clock destrói o AEC.
-3. **Half-duplex** (mutar o mic enquanto fala). Não faça: mata o barge-in, que é metade da sensação de "conversa".
-
-Decisão: interface `EchoCanceller` no `audio/`, implementação no-op por padrão, fones na Fase 1, WebRTC APM quando o hardware real entrar (M4+). Isso também reforça por que AEC é responsabilidade do **cliente**: ele precisa do sinal de referência do alto-falante local.
-
-Outros detalhes de áudio que causam bug real: taxa fixa de 16kHz mono na captura (resample no cliente, não no servidor), frames de 20ms, ring buffer com pre-roll de ~500ms (para o STT receber o começo da palavra que disparou o wake word), e captura em thread separada alimentando a asyncio loop — captura de áudio bloqueia e não pode competir com o event loop.
+**Risco honesto: o microfone integrado do PC é a peça mais fraca do sistema.** Array de notebook é ruidoso e capta longe. Se a transcrição vier errada, a causa provável é o microfone, não o modelo de STT — troque de provider por último, não primeiro. Mitigações que custam zero: normalizar ganho antes de enviar, cortar silêncio nas pontas, e falar a ~30 cm do aparelho.
 
 ---
 
-## 9. Wake word
+## 10. Providers da Fase 1 — tudo por API
 
-**openWakeWord** (local, gratuito, ~1% de CPU). Alternativa: Porcupine (mais preciso, licença paga acima de poucos usuários).
-
-Dois avisos concretos:
-
-- **"EVE" sozinho é curto demais** — duas fonemas, taxa alta de falso positivo em fala normal. Use **"Ei, EVE"** ou **"Ok, EVE"**. Isso não é detalhe estético: define se o sistema é usável no dia a dia.
-- **Verificação em dois estágios.** O detector dispara → o orquestrador abre o STT → se em 1,5s não vier fala plausível, volta para IDLE silenciosamente. Corta a maioria dos falsos positivos sem precisar de um modelo melhor.
-
-Não treine wake word customizado agora. Comece com um modelo pronto e troque depois — a interface `WakeWordDetector` isola isso.
-
----
-
-## 10. Providers recomendados para a Fase 1
-
-Todos atrás de interface; a escolha abaixo é o *default*, não um compromisso.
-
-| Camada | Default Fase 1 | Alternativa local | Alternativa cloud |
+| Camada | Default | Alternativa | Por quê |
 |---|---|---|---|
-| Wake word | openWakeWord | — (já é local) | Porcupine |
-| VAD | Silero VAD (local, ~1ms) | — | — |
-| STT | Deepgram Nova (streaming, pt-BR bom, ~150ms) | faster-whisper `large-v3-turbo` **exige GPU** | OpenAI `gpt-4o-transcribe` |
-| LLM | `claude-opus-5` | Ollama (Qwen/Llama) via mesma interface | — |
-| TTS | ElevenLabs Flash v2.5 (~75ms TTFB, pt-BR natural) | Piper (rápido, mas robótico em pt-BR) | Cartesia Sonic |
+| STT | **Groq** `whisper-large-v3-turbo` | OpenAI `gpt-4o-mini-transcribe`; Deepgram Nova-3 | Groq é o mais barato e um dos mais rápidos; Whisper vai bem em pt-BR |
+| LLM | **OpenRouter** → `anthropic/claude-haiku-4.5` | `anthropic/claude-sonnet-5`, `google/gemini-2.5-flash` | Menor TTFT útil com boa qualidade em pt-BR e bom uso de ferramentas |
+| TTS | **Azure Neural** pt-BR (free tier) | ElevenLabs Flash v2.5; OpenAI `tts-1` | Ver §11 — é a decisão que envolve dinheiro de verdade |
 
-Observações honestas:
-- `faster-whisper` **em CPU não serve** para tempo real com qualidade — `medium` fica acima de 1x realtime na maioria dos PCs. Sem GPU, STT é cloud.
-- Piper em pt-BR é utilizável mas não é "natural". Se o objetivo é validar a experiência, comece com ElevenLabs Flash e mantenha Piper como fallback offline.
-- Cada provider declara suas capacidades (`supports_streaming`, `supports_interim`, `languages`) para o orquestrador degradar em vez de quebrar.
+Cada provider declara suas capacidades (`supports_streaming`, `languages`, `output_formats`) para o orquestrador degradar em vez de quebrar.
 
 ---
 
-## 11. Camada LLM (detalhes que importam para voz)
+## 11. A tensão real: "voz natural" × "gastar o mínimo"
 
-Modelo: **`claude-opus-5`** via SDK oficial `anthropic`, streaming sempre.
+Vale dizer isso direto, porque é o único ponto do projeto onde os seus dois objetivos se contradizem.
+
+**O TTS é o item mais caro do sistema — não o LLM.** E é exatamente o item que determina se a experiência parece natural, que é o que você quer validar.
+
+| Provider | Qualidade pt-BR | Custo aproximado | Veredito |
+|---|---|---|---|
+| **Azure Neural** (vozes Francisca, Antônio, Thalita…) | Muito boa | **500 mil caracteres/mês grátis**, depois ~US$ 16/milhão | Melhor relação para o MVP. Exige conta Azure (cartão para verificação; o tier grátis não cobra) |
+| **OpenAI `tts-1`** | Boa, sotaque levemente neutro | ~US$ 15/milhão de caracteres | Zero fricção se você já tem chave OpenAI. ~US$ 4/mês no uso estimado |
+| **ElevenLabs Flash v2.5** | Melhor do mercado, e a mais rápida (~75 ms) | Plano Creator US$ 22/mês | Cara para uso contínuo |
+
+**Recomendação:** comece no **Azure**. Se depois de uma semana a voz parecer o elo fraco da experiência, **pague um mês de ElevenLabs e faça A/B** — a mesma frase nas duas vozes, ouvindo. Como a interface de TTS é trocável por configuração, esse teste custa uma linha de YAML e US$ 22 uma vez. Validar se a voz barata é boa o bastante é um uso legítimo de dinheiro; assinar ElevenLabs antes de saber se o resto funciona, não é.
+
+---
+
+## 12. Custos
+
+Estimativa para uso pessoal moderado: **50 turnos/dia**, ~6 s de fala por turno, ~180 caracteres de resposta.
+
+Isso dá, por mês: ~2,5 h de áudio de entrada · ~270 mil caracteres de saída · ~900 mil tokens de entrada e ~195 mil de saída.
+
+| Item | Escolha | Custo/mês estimado |
+|---|---|---|
+| STT | Groq `whisper-large-v3-turbo` | **~US$ 0,10** |
+| TTS | Azure Neural (dentro do free tier de 500 mil) | **US$ 0,00** |
+| LLM | OpenRouter → `anthropic/claude-haiku-4.5` | **~US$ 1,90** |
+| | **Total** | **~US$ 2/mês** |
+
+Se quiser trocar o cérebro por um mais forte, o impacto é menor do que parece:
+
+| Modelo (via OpenRouter) | Custo/mês no mesmo uso |
+|---|---|
+| `google/gemini-2.5-flash` | ~US$ 0,80 |
+| `anthropic/claude-haiku-4.5` | ~US$ 1,90 |
+| `anthropic/claude-sonnet-5` | ~US$ 3,80 |
+| `anthropic/claude-opus-5` | ~US$ 9,40 |
+
+**A conclusão que importa: não economize no LLM.** Mesmo o modelo mais caro fica abaixo de US$ 10/mês nesse volume. O que decide a conta é o TTS, e é lá que o free tier do Azure resolve o problema. Se a qualidade do raciocínio incomodar, subir de Haiku para Sonnet custa dois dólares — decida ouvindo, depois que o M1 estiver de pé.
+
+> Valores são ordem de grandeza, com preços de tabela de meados de 2026. Confira antes de assinar qualquer coisa. O `TurnTrace` (§14) registra o custo real por turno desde o M1, então em uma semana você troca essa estimativa por dado.
+
+---
+
+## 13. Camada LLM via OpenRouter
+
+OpenRouter expõe uma superfície compatível com OpenAI. Use o SDK `openai` com a base URL trocada — não escreva HTTP na mão.
 
 ```python
-stream = client.beta.messages.stream(
-    model="claude-opus-5",
-    max_tokens=1024,                          # respostas de voz são curtas
-    speed="fast",                             # até 2.5x tokens/s
-    betas=["fast-mode-2026-02-01", "server-side-fallback-2026-07-01"],
-    fallbacks="default",                      # nunca ficar mudo por recusa
-    output_config={"effort": "low"},          # conversa casual não precisa de effort alto
-    thinking={"type": "adaptive"},
-    system=[...],                             # persona + perfil, com cache_control
-    messages=[...],
-    tools=[...],
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
+
+stream = await client.chat.completions.create(
+    model="anthropic/claude-haiku-4.5",
+    messages=[...],            # system: persona + perfil; depois o histórico
+    tools=[...],               # formato de tools da OpenAI
+    stream=True,
+    max_tokens=400,            # resposta de voz é curta — isto é um limite real
+    extra_body={
+        "models": ["anthropic/claude-haiku-4.5",
+                   "google/gemini-2.5-flash"],   # fallback automático
+        "provider": {"sort": "latency"},          # roteia pelo mais rápido
+    },
 )
 ```
 
-Racional de cada escolha:
+**O que você ganha:** um endpoint para todos os modelos, troca por string de configuração, fallback automático quando um provider cai, e uma fatura só. É exatamente o requisito de "trocar o LLM sem reescrever".
 
-- **Fast mode** (`speed="fast"`, Opus 5 / 4.8 apenas, preview): custa mais por token mas aumenta bastante os tokens/s. Em voz, tokens/s vira "o EVE fala sem engasgar". Vale para o caminho conversacional; não vale para tarefas de fundo (extração de memória).
-- **`effort: "low"`** com thinking adaptativo. Turno de conversa não é problema difícil. Suba para `medium`/`high` só quando o turno envolver ferramenta complexa — dá para decidir por rota.
-- **Não desabilite o thinking.** No Opus 5, thinking desligado ocasionalmente faz o modelo escrever a chamada de ferramenta como texto visível em vez de emitir o bloco `tool_use` — em voz isso vira o EVE falando "vou chamar a função tocar_musica" em voz alta. Effort baixo resolve o custo/latência sem esse risco.
-- **`fallbacks: "default"`** com o beta de fallback do servidor: se uma requisição for recusada por classificador, o servidor roteia sozinho. Um assistente de voz não pode ficar em silêncio.
-- **Prompt caching** com ordem `tools → system → messages`: qualquer byte alterado no prefixo invalida tudo depois. Persona e definições de tools são estáveis → ficam no prefixo cacheado. Retrieval de memória e hora atual são voláteis → vão depois do último breakpoint.
-- **Mensagens `system` no meio da conversa** (suportado em Opus 5) para injetar contexto operacional — "o usuário te interrompeu", "agora são 22h" — sem invalidar o prefixo cacheado.
+**O que você perde, e é honesto dizer:**
 
-**Loop de tools:** comece com `client.beta.messages.tool_runner` (hooks por turno dão o gate de permissão e a interceptação de erro). Se o cancelamento por barge-in ficar desconfortável dentro do runner, caia para o loop manual — é uma decisão contida dentro de `AnthropicProvider`, invisível para o resto do sistema.
+- **Um salto de rede extra** — ~30 a 80 ms no TTFT.
+- **Recursos específicos de fornecedor.** Coisas como o formato nativo de cache de prompt da Anthropic, `effort`, ou o modo rápido do Opus não estão disponíveis pela superfície compatível com OpenAI. Se um dia você precisar deles, a interface `LLMProvider` permite adicionar um `AnthropicProvider` nativo ao lado, sem tocar no orquestrador.
+- **Variância entre provedores.** O mesmo slug pode ser servido por infraestruturas diferentes, com latências diferentes. Use `provider: {sort: "latency"}` e, se incomodar, fixe o provedor.
+
+**Regras de prompt que existem por causa da voz:**
+
+- `max_tokens` baixo é funcional, não econômico: resposta longa lida em voz alta é insuportável.
+- O system prompt precisa proibir markdown, listas numeradas e emojis explicitamente. O modelo escreve para tela por padrão, e isso arruína a experiência falada.
+- Ordem estável: `tools` → persona → perfil → histórico → turno atual. Ajuda o cache onde ele existir e mantém o diff do prompt legível.
 
 ---
 
-## 12. Tools
+## 14. Observabilidade
+
+Cada turno gera um `TurnTrace` impresso no terminal:
+
+```
+turno 7 │ áudio 4.2s │ stt 380ms │ llm_ttft 410ms │ tts_ttfb 190ms
+        │ 1º som 990ms │ total 3.4s │ 512 tok │ US$ 0.0011
+```
+
+Entrega do **M0**, não de "algum dia". O objetivo declarado da fase é avaliar a experiência, e a experiência é dominada por latência e custo. Sem a cascata de tempos você otimiza por palpite — e palpite em latência de áudio erra quase sempre. Com ela, em uma semana você sabe qual estágio é o gargalo real da *sua* máquina e da *sua* conexão.
+
+---
+
+## 15. Tools, memória e persona — o que entra agora
+
+Você pediu para adiar isso, e está certo. Mas a costura precisa existir para o M3 não virar reescrita.
+
+**Tools — no MVP:** o registry existe, com uma ou duas tools triviais (`que_horas_sao`, `ajustar_volume`) só para provar o caminho de ida e volta. A declaração já carrega os dois campos que existem por causa da voz:
 
 ```python
-@tool(
-    name="ajustar_volume",
-    risk=Risk.SAFE,                  # SAFE | CONFIRM | BLOCKED
-    budget=Budget.INSTANT,           # INSTANT <300ms | SHORT <3s | LONG async
-    filler="só um segundo",          # falado enquanto roda, se SHORT
-)
+@tool(name="ajustar_volume",
+      risk=Risk.SAFE,            # SAFE | CONFIRM | BLOCKED
+      budget=Budget.INSTANT)     # INSTANT <300ms | SHORT <3s | LONG async
 async def ajustar_volume(nivel: int) -> str: ...
 ```
 
-Três pontos de desenho que existem por causa da voz:
+`budget` existe porque silêncio de 8 segundos numa conversa é ruptura total: `SHORT` fala um preenchimento, `LONG` responde "te aviso quando terminar" e dispara um turno depois. `risk` existe porque comando de voz é entrada não autenticada — qualquer som na sala pode virar comando. **Nada de tool genérica de shell.** A ponte MCP e o controle de dispositivos entram no M4, no mesmo registry.
 
-1. **Orçamento de tempo é parte da declaração da tool.** Silêncio de 8 segundos numa conversa por voz é ruptura total. `INSTANT` roda invisível; `SHORT` fala um filler; `LONG` responde "te aviso quando terminar" e dispara um turno de fala não solicitado depois — o que exige que o orquestrador saiba **iniciar um turno sem input do usuário**. Isso precisa estar no desenho desde já, não é retrofit.
-2. **Permissão por risco, configurada fora do código.** Comando de voz é entrada não autenticada: qualquer som na sala pode virar comando. `CONFIRM` exige confirmação falada. **Não crie uma tool genérica de shell na Fase 1** — tools estreitas e específicas.
-3. **MCP como protocolo de extensão.** Um `MCPToolSource` conecta a servidores MCP locais (stdio) e registra as tools deles no mesmo registry, com o mesmo esquema de risco. Home Assistant, arquivos, música, calendário entram sem código novo — é exatamente o caminho para "futuramente controlar dispositivos". Tools nativas só para o que exige latência mínima ou acesso ao áudio local. (Nota: o conector MCP da API é server-side; aqui você quer um **cliente MCP local**, porque as ações acontecem no seu PC.)
+**Memória — no MVP:** só working memory (últimos N turnos em RAM, limitados por tokens). A interface `MemoryStore` existe e tem uma implementação vazia. SQLite + `sqlite-vec`, extração de fatos em background e as tools `lembrar`/`esquecer` entram no M3.
 
----
-
-## 13. Memória vs. Personalidade
-
-Você pediu essa separação e ela está certa. O motivo é ciclo de vida:
-
-| | Personalidade | Memória |
-|---|---|---|
-| O que é | Entrada do sistema | Dado do usuário |
-| Onde vive | `persona/*.yaml` versionado no git | `eve.db` (SQLite), fora do git |
-| Quem edita | Você, iterando prompt | O EVE, em runtime |
-| Como se testa | Diff, revisão, rollback | Inspeção, edição, apagar |
-| Se apagar | `git checkout` | Perdeu de verdade — precisa de backup |
-
-Misturar os dois é o erro clássico: você acaba sem conseguir versionar a personalidade nem apagar dados pessoais.
-
-### Personalidade
+**Persona — no MVP:** já vale a pena, porque é o que faz a EVE soar como EVE e custa um arquivo.
 
 ```yaml
 # persona/eve.yaml
@@ -295,82 +365,44 @@ identity: >
   Assistente pessoal do Gustavo. Direta, sem enrolação.
 voice_style:
   max_sentences: 3
-  avoid: [listas numeradas, markdown, emojis, "Como posso ajudar?"]
+  avoid: [markdown, listas numeradas, emojis, "Como posso ajudar?"]
   register: informal
 behaviors:
   - se não souber, diga que não sabe
   - antes de ação destrutiva, confirme
-tts:
-  provider: elevenlabs
-  voice_id: "..."
 ```
 
-Um template renderiza isso no system prompt. **Regra dura:** o LLM por padrão escreve para tela — listas, markdown, parágrafos. Isso arruína a experiência de voz. Além da instrução no prompt, o orquestrador tem um limitador: se a resposta passar de N frases, ele registra e a próxima instrução do sistema aperta. Trocar persona = trocar arquivo, sem tocar em código.
+A separação entre persona e memória continua sendo a mesma decisão da v1, e o motivo é ciclo de vida:
 
-### Memória
-
-SQLite único (`eve.db`) com `sqlite-vec` para embeddings. Não precisa de banco vetorial dedicado nessa escala — e não precisará tão cedo.
-
-```sql
-sessions(id, started_at, ended_at)
-turns(id, session_id, ts, role, text, latency_json)        -- episódica, append-only
-facts(id, key, value, confidence, pinned, source_turn_id,
-      created_at, updated_at, expires_at)                   -- semântica / perfil
-fact_embeddings(fact_id, embedding)                         -- sqlite-vec
-summaries(id, session_id, period, text, embedding)          -- consolidação
-```
-
-Quatro camadas em runtime:
-
-1. **Working memory** — últimos N turnos em RAM, limitados por tokens.
-2. **Bloco de perfil** — facts `pinned` ou de alta importância, sempre injetados (~200 tokens). Mudam raramente → ficam no prefixo cacheado; escrever um fato invalida o cache uma vez, o que é aceitável.
-3. **Retrieval** — top-k por similaridade sobre `facts` + `summaries`, injetado depois do breakpoint de cache.
-4. **Escrita** — **sempre fora do caminho crítico.** Depois do turno, uma task de fundo roda um extrator (modelo barato, `claude-haiku-4-5`) sobre o turno, propõe fatos, deduplica por similaridade e faz upsert. Escrita de memória **nunca** adiciona latência ao turno.
-
-Além da extração automática, tools explícitas: `lembrar(fato)`, `esquecer(consulta)`, `o_que_voce_sabe_sobre(consulta)`. Isso dá ao usuário controle por voz sobre o que o assistente guarda — o que importa para confiança, não só para funcionalidade.
+| | Personalidade | Memória |
+|---|---|---|
+| O que é | Entrada do sistema | Dado do usuário |
+| Onde vive | `persona/*.yaml`, no git | `eve.db`, fora do git |
+| Quem edita | Você, iterando o prompt | A EVE, em runtime |
+| Se apagar | `git checkout` | Perdeu — precisa de backup |
 
 ---
 
-## 14. Transporte e a fronteira cliente/servidor
-
-Um WebSocket, frames binários para áudio e JSON para controle.
-
-- **Subida:** PCM16 mono 16kHz, frames de 20ms (320 amostras / 640 bytes). Opus quando houver rede de verdade.
-- **Descida:** PCM16 mono 24kHz (saída típica de TTS) ou Opus.
-- **Controle:** `wake`, `eou` (fim de fala), `barge_in`, `state`, `transcript{partial,text}`, `speak_start`, `speak_end`, `error`.
-
-Regra de ouro: **o cliente decide quando começar e parar de ouvir.** VAD e wake word no servidor significam pagar RTT em cada decisão de turno e ter um dispositivo inútil sem rede.
-
-Implementação: `Transport` como Protocol, com `InProcessTransport` (filas asyncio, latência zero) e `WebSocketTransport`. A Fase 1 roda in-process; M4 vira dois processos com uma flag de config. Como as interfaces são as mesmas dos dois lados, não há reescrita — é essa a razão de definir a fronteira agora.
-
----
-
-## 15. Configuração e troca de providers
+## 16. Configuração e troca de providers
 
 ```yaml
-# config/profiles/cloud.yaml
-stt:  {provider: deepgram,   model: nova-3,     language: pt-BR}
-llm:  {provider: anthropic,  model: claude-opus-5, effort: low, fast: true}
-tts:  {provider: elevenlabs, voice_id: "...",   model: flash_v2_5}
-wake: {provider: openwakeword, phrase: "ei eve", threshold: 0.6}
-vad:  {provider: silero, min_silence_ms: 300, adaptive: true}
+# config/profiles/default.yaml
+ptt:  {backend: pynput, key: ctrl+space, mode: hold}   # hold | toggle
+audio:
+  input_device: null        # null = default do Windows; fixe o índice depois
+  output_device: null
+stt:  {provider: groq, model: whisper-large-v3-turbo, language: pt}
+llm:
+  provider: openrouter
+  model: anthropic/claude-haiku-4.5
+  fallbacks: [google/gemini-2.5-flash]
+  max_tokens: 400
+tts:  {provider: azure, voice: pt-BR-FranciscaNeural, format: raw-24khz-16bit-mono-pcm}
 ```
 
-`EVE_PROFILE=local|cloud` troca tudo. Registry de fábricas por nome; nenhuma classe concreta importada fora do seu módulo.
+Registry de fábricas por nome; nenhuma classe concreta importada fora do seu módulo. Chaves de API só por variável de ambiente — nunca no YAML, que vai para o git.
 
-**O que realmente torna providers trocáveis não é a interface — é o teste de contrato.** `tests/contracts/test_stt.py` roda contra *qualquer* implementação de `STTProvider` com um WAV fixo e verifica: emite parciais, emite final, respeita cancelamento, fecha sem vazar socket, reporta latência. Um provider novo só entra se passar. Sem isso, "arquitetura trocável" é ficção — e a descoberta acontece no pior momento.
-
----
-
-## 16. Observabilidade
-
-Cada turno gera um `TurnTrace` com marcos temporais, impresso no terminal:
-
-```
-turno 7  fala 1.84s │ stt_final +118ms │ llm_ttft +402ms │ tts_ttfb +91ms │ 1º áudio 611ms │ total 3.2s │ 340 tok │ $0.004
-```
-
-Isso é entrega do **M0**, não de "algum dia". O objetivo declarado da fase é avaliar a experiência, e a experiência é dominada por latência. Sem a cascata de tempos, você vai otimizar por palpite.
+**O que realmente torna providers trocáveis não é a interface — é o teste de contrato.** `tests/contracts/test_tts.py` roda contra *qualquer* implementação de `TTSProvider` e verifica: devolve PCM na taxa declarada, emite o primeiro chunk antes do texto acabar, respeita cancelamento, fecha sem vazar conexão, reporta latência. Um provider novo só entra se passar. Sem isso, "arquitetura trocável" é uma promessa que você descobre ser falsa exatamente quando mais precisa dela.
 
 ---
 
@@ -379,63 +411,70 @@ Isso é entrega do **M0**, não de "algum dia". O objetivo declarado da fase é 
 ```
 eve/
   core/       contracts.py (Protocols) · events.py · config.py · trace.py
-  audio/      capture.py · playback.py · resample.py · aec.py · ring.py
-  wake/       base.py · openwakeword_detector.py
-  vad/        base.py · silero.py
-  stt/        base.py · deepgram.py · whisper_local.py
-  llm/        base.py · anthropic_provider.py · ollama_provider.py
-  tts/        base.py · elevenlabs.py · piper.py
-  agent/      orchestrator.py · turn.py (máquina de estados) · context.py · chunker.py
-  tools/      registry.py · permissions.py · builtin/ · mcp_bridge.py
-  memory/     store.py · retrieval.py · extraction.py · schema.sql
+  client/     ptt.py · capture.py · playback.py · devices.py
+  stt/        base.py · groq.py · openai.py
+  llm/        base.py · openrouter.py
+  tts/        base.py · azure.py · elevenlabs.py · openai.py
+  agent/      orchestrator.py · turn.py · context.py · chunker.py
+  tools/      registry.py · permissions.py · builtin/
+  memory/     base.py · working.py           # sqlite.py entra no M3
   persona/    eve.yaml · render.py
-  transport/  base.py · inprocess.py · ws_server.py · ws_client.py
-  apps/       cli.py · server.py · client.py
-config/       default.yaml · profiles/{local,cloud}.yaml
+  transport/  base.py · inprocess.py         # ws_*.py entram na Fase 2
+  apps/       cli.py
+config/       profiles/default.yaml
 tests/        contracts/ · integration/
 ```
 
-Um pacote, várias camadas. Não quebre em múltiplos repositórios agora — o custo de coordenação não se paga antes do M4.
+Um pacote, duas camadas conceituais (`client/` e o resto). Não quebre em repositórios separados agora — o custo de coordenação não se paga antes da Fase 2.
 
 ---
 
 ## 18. Roadmap
 
+**Fase 1 — validar a experiência (é onde você está)**
+
 | Marco | Entrega | O que prova |
 |---|---|---|
-| **M0** | Áudio in/out + `TurnTrace` + loop push-to-talk que só ecoa o transcript | O stack de áudio funciona no seu SO |
-| **M1** | Cascata STT→LLM→TTS streaming, push-to-talk, sem tools | **Aqui você sente a latência real e decide se o caminho é viável** |
-| **M2** | Wake word + endpointing adaptativo + barge-in | Vira hands-free — é aqui que parece um assistente |
-| **M3** | Tool registry + ponte MCP + memória + persona | Vira útil |
-| **M4** | Transporte WebSocket, dois processos na mesma máquina | Prova que a fronteira do dispositivo é real |
-| **M5** | Segundo provider por camada + testes de contrato + benchmark de latência/custo | Decide o que vai para o hardware |
+| **M0** | Hotkey + captura + playback + `TurnTrace`, gravando e tocando de volta | O stack de áudio funciona no seu Windows, com o seu microfone |
+| **M1** | STT → LLM → TTS streaming ponta a ponta | **É o MVP. Aqui você sente a latência e a voz reais e decide se o caminho vale.** |
+| **M2** | Barge-in, chunking afinado, tratamento de erro, persona, tools triviais | Deixa de ser demo e vira algo que você usa todo dia |
+| **M3** | Memória em SQLite, extração em background, tools `lembrar`/`esquecer` | A EVE passa a te conhecer |
 
-Ordem deliberada: M1 vem antes de wake word porque push-to-talk elimina AEC e falso positivo da equação e deixa você medir a latência pura da cascata. Se M1 não ficar bom, nada depois salva.
+**Fase 2 — hands-free (só depois que a Fase 1 estiver excelente)**
+
+| Marco | Entrega |
+|---|---|
+| M4 | WebSocket entre Voice Client e EVE Core, dois processos |
+| M5 | Wake word + VAD + AEC — os três juntos, porque um cria a necessidade do outro |
+| M6 | Ponte MCP, smart home, controle do computador |
+
+**Fase 3 — hardware.** Só depois de a Fase 2 estar estável. O Voice Client já estará isolado e falando WebSocket, que é o pré-requisito real.
+
+M0 vem antes do M1 por um motivo prático: se o microfone integrado do seu PC for ruim demais, você descobre em uma tarde gravando e ouvindo, não depois de integrar três APIs.
 
 ---
 
 ## 19. O que NÃO fazer na Fase 1
 
-GUI · hardware/ESP32 · Docker · multiusuário · RAG sobre documentos · treinar wake word customizado · clonar voz · autenticação · Kubernetes · fila de mensagens · microserviços.
+GUI · wake word · VAD · AEC · modelos locais · hardware · Docker · RAG sobre documentos · smart home · controle complexo do computador · clonagem de voz · multiusuário · autenticação · fila de mensagens · microserviços.
 
-Cada um deles adiciona semanas e nenhum responde à pergunta "conversar com o EVE é bom?".
-
----
-
-## 20. Riscos, em ordem de probabilidade de te atrapalhar
-
-1. **Endpointing em português.** O sistema corta você no meio da frase enquanto você pensa. É a maior fonte de frustração em assistentes de voz — mais do que latência bruta. Vale mais tempo do que otimizar 100ms de TTFT.
-2. **AEC.** Fones adiam o problema; o hardware o traz de volta inteiro. Planejado, não resolvido.
-3. **O LLM escreve para tela, não para voz.** Resposta de 5 parágrafos lida em voz alta é insuportável. Prompt + limitador, e verifique a cada mudança de persona.
-4. **Tools longas.** Sem o desenho de turno assíncrono, qualquer ação de 10s quebra a conversa.
-5. **Custo em nuvem.** Wake word local evita streaming contínuo, mas meça desde o M1 — o `TurnTrace` já carrega o custo por turno.
-6. **Falsos positivos de wake word.** "Ei, EVE" + verificação em dois estágios. Um sistema que acorda sozinho é abandonado em uma semana.
+Cada um adiciona semanas, e nenhum responde à única pergunta desta fase: *conversar com a EVE é bom?*
 
 ---
 
-## 21. Perguntas em aberto (mudam o desenho)
+## 20. Riscos, em ordem de probabilidade
 
-1. **Sistema operacional?** Muda o stack de áudio (PipeWire / WASAPI / CoreAudio) e a viabilidade do AEC.
-2. **Tem GPU?** Define se `faster-whisper` local é opção real ou se STT é obrigatoriamente cloud.
-3. **Nuvem é aceitável, ou local-first por privacidade?** Muda o default de todas as três camadas.
-4. **Fones ou alto-falante aberto na Fase 1?** Define se AEC entra no M2 ou no M4.
+1. **Microfone integrado ruim.** O elo mais fraco e o mais barato de diagnosticar — por isso o M0 existe. Se a transcrição vier errada, suspeite do microfone antes do modelo.
+2. **A voz não convence.** Você quer validar naturalidade e escolheu o caminho barato. Mitigação: A/B com ElevenLabs por um mês (§11), decidido ouvindo, não no papel.
+3. **O LLM escreve para tela.** Cinco parágrafos lidos em voz alta são insuportáveis. Prompt + `max_tokens` baixo + verificação a cada mudança de persona.
+4. **Latência acumulada em três APIs.** Três saltos de rede em série; conexão ruim multiplica tudo. O `TurnTrace` mostra qual estágio é o culpado.
+5. **Ruído do alto-falante entrando na gravação.** Improvável com PTT, mas se você apertar a tecla enquanto a EVE ainda fala, ela se ouve. Mitigação trivial: `ptt_down` corta o playback *antes* de abrir o microfone.
+6. **Rate limit ou instabilidade do free tier.** O tier grátis do Azure tem limite de concorrência. Para um usuário só, sobra — mas trate erro de TTS com um fallback falado, não com silêncio.
+
+---
+
+## 21. Perguntas em aberto
+
+1. **Quais chaves de API você já tem?** (OpenRouter, Groq, Azure, OpenAI, ElevenLabs) — define o default de STT e TTS do M1.
+2. **O atalho precisa funcionar com o terminal fora de foco?** Se sim, `pynput` global; se não, dá para simplificar mais ainda.
+3. **Notebook ou desktop, e que microfone?** Muda o quanto o M0 precisa investigar antes de seguir.
