@@ -3,7 +3,7 @@
     python -m eve                       inicia (equivale a `run`)
     python -m eve.apps.cli devices      lista dispositivos de áudio
     python -m eve.apps.cli doctor       checa dependências e permissões
-    python -m eve.apps.cli permissions  pede a permissão de teclado (macOS)
+    python -m eve.apps.cli permissions  pede as permissões do macOS
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         ("sounddevice", "sounddevice"),
         ("pynput", "pynput"),
         ("yaml", "pyyaml"),
-    ):
+    ) + ((("AVFoundation", "pyobjc-framework-AVFoundation"),) if sys.platform == "darwin" else ()):
         try:
             __import__(modulo)
             print(f"  [ ok  ] {pacote}")
@@ -74,6 +74,9 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         print()
         if permissions.check_input_monitoring().granted is not True:
             print(permissions.manual_instructions())
+            print()
+        if permissions.check_microphone().granted is False:
+            print(permissions.microphone_instructions())
             print()
     else:
         print(f"Sistema: {sys.platform} — as checagens de permissão são específicas do macOS.\n")
@@ -102,15 +105,47 @@ def cmd_permissions(_: argparse.Namespace) -> int:
         print(f"Sistema {sys.platform}: nada a conceder.")
         return 0
 
-    status = permissions.check_input_monitoring()
-    if status.granted is True:
-        print("Monitoramento de Entrada: já concedida. Nada a fazer.")
-        return 0
+    faltou = False
 
-    print("Monitoramento de Entrada: ainda não concedida.\n")
-    print("Abrindo o diálogo do sistema — clique em Abrir Ajustes do Sistema...\n")
-    permissions.request_input_monitoring()
-    print(permissions.manual_instructions())
+    # 1) Teclado
+    entrada = permissions.check_input_monitoring()
+    if entrada.granted is True:
+        print("[ ok  ] Monitoramento de Entrada")
+    else:
+        faltou = True
+        print("[FALTA] Monitoramento de Entrada — abrindo o diálogo...\n")
+        permissions.request_input_monitoring()
+        print(permissions.manual_instructions())
+        print()
+
+    # 2) Microfone
+    mic = permissions.check_microphone()
+    if mic.granted is True:
+        print("[ ok  ] Microfone")
+    elif mic.granted is None and "AVFoundation" in mic.hint:
+        faltou = True
+        print("[  ?  ] Microfone — não dá para consultar o estado.")
+        print("        pip install pyobjc-framework-AVFoundation")
+    elif mic.granted is None:
+        print("[  ?  ] Microfone — ainda não foi pedida. Abrindo o diálogo...")
+        if permissions.request_microphone():
+            print("[ ok  ] Microfone concedida.")
+        else:
+            faltou = True
+            print("[FALTA] Microfone: não concedida.\n")
+            print(permissions.microphone_instructions())
+    else:
+        faltou = True
+        print("[FALTA] Microfone: negada.\n")
+        print(permissions.microphone_instructions())
+
+    if not faltou:
+        print("\nTudo concedido. Rode `python -m eve`.")
+    else:
+        print(
+            "\nDepois de conceder, FECHE E REABRA o terminal "
+            "(a permissão só vale no próximo processo) e rode este comando de novo."
+        )
     return 0
 
 
@@ -177,6 +212,13 @@ async def _run(cfg: Config) -> int:
             "        Se atrapalhar, desative em Ajustes › Teclado › Atalhos › Fontes de\n"
             "        entrada, ou troque a tecla em config/profiles/default.yaml."
         )
+    mic = permissions.check_microphone()
+    if mic.granted is False:
+        print(
+            "\n  aviso: a permissão de Microfone está NEGADA — a captura vai vir muda.\n"
+            "         Rode `python -m eve.apps.cli permissions` para resolver."
+        )
+
     print("\nEVE READY")
     print(f"Pressione {cfg.ptt.key.upper()} para falar · Ctrl+C para sair")
 
@@ -257,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("devices", help="lista os dispositivos de áudio").set_defaults(func=cmd_devices)
     sub.add_parser("doctor", help="checa dependências e permissões").set_defaults(func=cmd_doctor)
     sub.add_parser(
-        "permissions", help="pede a permissão de Monitoramento de Entrada (macOS)"
+        "permissions", help="pede as permissões de teclado e microfone (macOS)"
     ).set_defaults(func=cmd_permissions)
     return parser
 

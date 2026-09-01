@@ -94,18 +94,22 @@ class MicrophoneSource:
         self._resampler = Resampler(rate, self._format.sample_rate)
 
     def prepare(self) -> None:
-        """Negocia taxa e canais sem começar a capturar.
+        """Negocia e já constrói o stream, sem começar a capturar.
 
-        Existe para a CLI poder mostrar a taxa real na linha "Input:" antes de o
-        primeiro turno acontecer, sem alcançar dentro da classe.
+        Duas razões para fazer isso na partida e não no primeiro turno:
+        a linha "Input:" precisa mostrar a taxa real, e construir o stream custa
+        dezenas de milissegundos — deixar para o primeiro `start()` faria o
+        Turn 1 medir uma abertura que nenhum turno seguinte tem, além de comer a
+        primeira sílaba justamente no teste inicial. O indicador laranja do
+        macOS não acende aqui: só em `start()`.
         """
-        if self._resampler is None:
-            self._negotiate()
+        if self._stream is None:
+            self._open()
 
     def _open(self) -> None:
         import sounddevice as sd
 
-        self.prepare()
+        self._negotiate()
         blocksize = self._capture_rate * self._format.frame_ms // 1000
         self._stream = sd.InputStream(
             device=self._device.index,

@@ -12,6 +12,9 @@ dependencies = [
     "sounddevice>=0.4.6",   # a roda de macOS traz a libportaudio.dylib embutida
     "pynput>=1.7.6",        # atalho global; no macOS puxa pyobjc-framework-Quartz
     "pyyaml>=6.0",
+    # Só no macOS: sem ele não dá para saber se a permissão de Microfone foi
+    # negada, e a captura muda vira um mistério em vez de uma mensagem.
+    'pyobjc-framework-AVFoundation>=10.0; sys_platform == "darwin"',
 ]
 
 [project.optional-dependencies]

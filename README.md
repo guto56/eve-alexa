@@ -25,7 +25,7 @@ a `libportaudio.dylib` embutida.
 python -m eve                     # inicia a EVE
 python -m eve.apps.cli devices    # lista os dispositivos de áudio
 python -m eve.apps.cli doctor     # checa dependências, permissões e devices
-python -m eve.apps.cli permissions # pede a permissão de teclado (macOS)
+python -m eve.apps.cli permissions # pede as permissões do macOS
 ```
 
 Segure `CTRL+SPACE`, fale, solte. Você ouve a própria gravação e vê o turno:
@@ -70,6 +70,24 @@ Dos dois jeitos: ative o interruptor e **feche e reabra o terminal**.
 
 Se o macOS não mostrar o diálogo, é porque ele só pergunta uma vez por app —
 `tccutil reset ListenEvent` reseta e faz ele perguntar de novo.
+
+### "Status: SEM SINAL / pico -inf dBFS"
+
+O microfone entregou silêncio digital. Quase sempre é permissão de Microfone.
+
+**O painel do Microfone não tem botão `+`** — diferente do de Monitoramento de
+Entrada, você não consegue adicionar o app à mão; ele só lista quem já pediu. E
+o macOS só pergunta uma vez por app: se a permissão já foi negada, ele nunca
+mais pergunta. O desbloqueio é:
+
+```bash
+tccutil reset Microphone
+python -m eve
+```
+
+O diálogo aparece na primeira gravação. Confira também **Ajustes › Som ›
+Entrada**: volume de entrada no zero dá silêncio digital mesmo com permissão
+concedida.
 
 ## `ctrl+space` no macOS
 

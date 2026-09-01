@@ -86,28 +86,87 @@ def request_input_monitoring() -> bool:
         return False
 
 
-def check_microphone() -> PermissionStatus:
-    """Microfone. Best-effort: só é determinável se pyobjc-framework-AVFoundation
-    estiver instalado. Sem ele, o sinal de verdade é o nível do áudio capturado."""
-    path = "Ajustes do Sistema › Privacidade e Segurança › Microfone"
-    hint = (
-        f"Ative {host_app()} nessa lista. Na primeira captura o macOS costuma "
-        "perguntar sozinho; se você já negou uma vez, ele não pergunta de novo."
-    )
+_MIC_INDETERMINADO, _MIC_RESTRITO, _MIC_NEGADO, _MIC_AUTORIZADO = 0, 1, 2, 3
+
+
+def _mic_status_code() -> int | None:
     if not IS_MACOS:
-        return PermissionStatus("Microfone", None, path, "só se aplica ao macOS")
+        return None
     try:
         from AVFoundation import AVCaptureDevice, AVMediaTypeAudio  # type: ignore
 
-        status = AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio)
-        # 0 indeterminado · 1 restrito · 2 negado · 3 autorizado
-        if status == 3:
-            return PermissionStatus("Microfone", True, path, hint)
-        if status in (1, 2):
-            return PermissionStatus("Microfone", False, path, hint)
-        return PermissionStatus("Microfone", None, path, "ainda não foi pedida — será pedida na primeira captura")
+        return int(AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio))
     except Exception:
-        return PermissionStatus("Microfone", None, path, hint)
+        return None
+
+
+def check_microphone() -> PermissionStatus:
+    path = "Ajustes do Sistema › Privacidade e Segurança › Microfone"
+    hint = f"Ative {host_app()} nessa lista."
+    if not IS_MACOS:
+        return PermissionStatus("Microfone", None, path, "só se aplica ao macOS")
+
+    codigo = _mic_status_code()
+    if codigo is None:
+        return PermissionStatus(
+            "Microfone", None, path,
+            "não foi possível consultar — falta pyobjc-framework-AVFoundation",
+        )
+    if codigo == _MIC_AUTORIZADO:
+        return PermissionStatus("Microfone", True, path, hint)
+    if codigo == _MIC_INDETERMINADO:
+        return PermissionStatus(
+            "Microfone", None, path,
+            "ainda não foi pedida — rode `python -m eve.apps.cli permissions`",
+        )
+    return PermissionStatus("Microfone", False, path, hint)
+
+
+def request_microphone(timeout_s: float = 30.0) -> bool:
+    """Dispara o diálogo do sistema e espera a resposta.
+
+    O completion handler do AVFoundation roda em outra fila, então o resultado
+    vem por polling do status em vez de por callback — num CLI não há run loop
+    do AppKit para entregar o callback.
+    """
+    import time
+
+    if not IS_MACOS:
+        return True
+    try:
+        from AVFoundation import AVCaptureDevice, AVMediaTypeAudio  # type: ignore
+
+        AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+            AVMediaTypeAudio, lambda concedido: None
+        )
+    except Exception:
+        return False
+
+    limite = time.monotonic() + timeout_s
+    while time.monotonic() < limite:
+        codigo = _mic_status_code()
+        if codigo in (_MIC_AUTORIZADO, _MIC_NEGADO, _MIC_RESTRITO):
+            return codigo == _MIC_AUTORIZADO
+        time.sleep(0.25)
+    return False
+
+
+def microphone_instructions() -> str:
+    """O painel de Microfone é diferente do de Monitoramento de Entrada: ele não
+    tem botão +. Um app só aparece ali depois de pedir a permissão, e se já foi
+    negada uma vez o macOS nunca mais pergunta — daí o tccutil."""
+    return "\n".join([
+        "O painel do Microfone NÃO tem botão + — não dá para adicionar o app à mão.",
+        "Ele só lista quem já pediu a permissão. Se a permissão foi negada uma vez,",
+        "o macOS não pergunta de novo. Para forçar a pergunta:",
+        "",
+        "    tccutil reset Microphone",
+        "",
+        "e rode `python -m eve` outra vez: o diálogo aparece na primeira gravação.",
+        "",
+        "Confira também Ajustes do Sistema › Som › Entrada: se o volume de entrada",
+        "estiver no zero, a captura devolve silêncio digital mesmo com permissão.",
+    ])
 
 
 def manual_instructions() -> str:
