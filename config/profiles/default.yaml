@@ -1,0 +1,18 @@
+# Perfil padrão do EVE. Selecione outro com EVE_PROFILE=<nome>.
+# Chaves de API nunca entram aqui — só variáveis de ambiente.
+
+audio:
+  input_device: null      # null = dispositivo padrão do sistema
+  output_device: null     # aceita também o índice (int) ou parte do nome (str)
+  sample_rate: 16000
+  frame_ms: 20
+
+ptt:
+  backend: pynput
+  key: ctrl+space
+  mode: hold              # hold | toggle
+
+# M1 em diante — ainda não implementado:
+# stt: {provider: groq,       model: whisper-large-v3-turbo, language: pt}
+# llm: {provider: openrouter, model: anthropic/claude-haiku-4.5}
+# tts: {provider: azure,      voice: pt-BR-FranciscaNeural}

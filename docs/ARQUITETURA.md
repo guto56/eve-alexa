@@ -1,4 +1,4 @@
-# EVE — Arquitetura (Fase 1: MVP push-to-talk, 100% API, Windows 11)
+# EVE — Arquitetura (Fase 1: MVP push-to-talk, 100% API, macOS)
 
 > Documento de decisão, v2. Nada implementado ainda.
 > Objetivo desta fase: **fazer `tecla → fala → resposta em voz natural` ficar excelente**, gastando o mínimo possível, sem comprar nada.
@@ -14,7 +14,7 @@
 | LLM | SDK Anthropic direto | **OpenRouter** (superfície compatível com OpenAI) |
 | Entrada de voz | wake word + VAD desde o M2 | **push-to-talk no MVP**; wake word/VAD viram Fase 2 |
 | Eco / AEC | risco nº 2, mitigado com fones | **dissolvido pelo push-to-talk** (§4) |
-| SO | genérico | **Windows 11**, com o que isso implica (§9) |
+| SO | genérico | **macOS**, com o que isso implica (§9) |
 | Custo | não era seção | **seção própria (§12)** — "gastar o mínimo" virou requisito de projeto |
 
 O que **não** mudou: a separação Voice Client / EVE Core, os contratos streaming, a separação memória × personalidade e a regra de que a fronteira do dispositivo existe no código desde o primeiro dia.
@@ -25,7 +25,7 @@ O que **não** mudou: a separação Voice Client / EVE Core, os contratos stream
 
 | Decisão | Escolha | Por quê |
 |---|---|---|
-| Linguagem | Python 3.11+ / asyncio | Áudio, SDKs e HTTP streaming no mesmo lugar; roda bem em Windows |
+| Linguagem | Python 3.11+ / asyncio | Áudio, SDKs e HTTP streaming no mesmo lugar; CoreAudio bem servido por PortAudio |
 | Interação | **Push-to-talk** (segurar tecla) | Elimina wake word, VAD, endpointing e eco de uma vez só |
 | Modelo de conversa | Cascata: STT → LLM → TTS | Requisito de trocar provider por configuração |
 | STT | **Batch** (áudio completo no release) | PTT te dá o fim da fala de graça; streaming vira otimização do M2 |
@@ -40,7 +40,7 @@ O que **não** mudou: a separação Voice Client / EVE Core, os contratos stream
 
 ## 2. Premissas da Fase 1
 
-1. **Nenhum hardware novo.** Microfone integrado (ou o que já estiver plugado) e alto-falantes do PC. Windows 11.
+1. **Nenhum hardware novo.** Microfone integrado e alto-falantes do próprio Mac. Desenvolvimento e teste em macOS.
 2. **Nenhum modelo local.** Sem GPU no orçamento, sem download de pesos, sem CUDA. Tudo API.
 3. **Custo mínimo.** O sistema precisa custar poucos dólares por mês em uso pessoal, e isso é uma restrição de projeto — não um detalhe operacional.
 4. **Terminal, sem GUI.** A interface é uma tecla e o alto-falante.
@@ -83,7 +83,7 @@ O custo dessa escolha é uma coisa só: não é hands-free. Para validar a exper
 ```
 ┌───────── VOICE CLIENT (vira o dispositivo na Fase 3) ─────────┐
 │                                                                │
-│   Hotkey global ──► Captura (WASAPI, 16 kHz mono)             │
+│   Hotkey global ──► Captura (CoreAudio, 16 kHz mono)          │
 │         │                      │                               │
 │         │ ptt_up               │ buffer PCM16 em RAM           │
 │         ▼                      ▼                               │
@@ -214,16 +214,18 @@ Comparado com a v1 (0,8–1,5 s), o teto piorou um pouco: o STT batch substitui 
 
 ---
 
-## 9. Áudio no Windows 11 — detalhes que causam dor
+## 9. Áudio no macOS — detalhes que causam dor
 
-- **Captura e playback:** `sounddevice` (PortAudio) com backend WASAPI. Funciona bem no Windows 11 e não exige nada instalado além do pacote Python.
-- **Hotkey global:** `pynput` — funciona com o terminal fora de foco e **não exige privilégio de administrador** (diferente da biblioteca `keyboard`, que exige em vários cenários). Segurar-para-falar via listener de press/release. Vale ter um modo alternativo de alternância (aperta uma vez para começar, outra para parar) porque "segurar" em terminal às vezes conflita com atalhos do Windows.
-- **Peça PCM cru ao TTS.** ElevenLabs (`output_format=pcm_24000`), OpenAI (`response_format="pcm"`, 24 kHz 16-bit mono) e Azure (`Raw24Khz16BitMonoPcm`) devolvem PCM direto. Isso remove um decoder de MP3 do caminho crítico e evita depender de `ffmpeg`/`pyav` no Windows, que é onde a instalação costuma quebrar.
-- **Escolha o dispositivo explicitamente.** Windows troca o default sozinho quando você pluga qualquer coisa. Fixe o índice do device na config e logue qual foi aberto.
-- **Formatos fixos:** captura em 16 kHz mono PCM16, playback em 24 kHz mono PCM16. Resample no cliente, nunca no core.
-- **Captura em thread separada** alimentando o event loop por fila. Callback de áudio bloqueia e não pode competir com o asyncio.
+- **Captura e playback:** `sounddevice` (PortAudio) sobre CoreAudio. A roda de macOS do `sounddevice` **já traz a `libportaudio.dylib` embutida** — não é preciso `brew install portaudio`.
+- **Atalho global:** `pynput`, que no macOS usa um *event tap* do Quartz e por isso exige a permissão de **Monitoramento de Entrada**. Ela é concedida ao *aplicativo de terminal* (Terminal, iTerm, VS Code, Warp), nunca ao binário do Python, e só passa a valer depois de reiniciar o terminal. Sem ela o listener sobe normalmente e nunca recebe nada — falha silenciosa, o pior tipo. `Quartz.CGPreflightListenEventAccess()` detecta o estado antes de o usuário perder tempo.
+- **`ctrl+space` colide com o sistema.** É o atalho padrão de "Selecionar a fonte de entrada anterior". Com mais de um layout de teclado instalado, ele troca o layout junto com a fala. Desative em Ajustes do Sistema › Teclado › Atalhos de Teclado › Fontes de entrada, ou troque a tecla na config. (`cmd+space` é o Spotlight — não sirva de alternativa.)
+- **Microfone nega em silêncio.** Sem permissão de Microfone a captura devolve zeros em vez de erro. Por isso o `TurnTrace` reporta pico e RMS: pico em `-inf dBFS` é diagnóstico, não estatística.
+- **Não abra o stream por turno.** Abrir um dispositivo CoreAudio custa dezenas de milissegundos e cortaria a primeira sílaba a cada vez. Construa o stream uma vez e faça apenas `start()`/`stop()` por turno — o indicador laranja do macOS acende só enquanto ele roda, então a propriedade "o microfone só grava com a tecla pressionada" continua valendo.
+- **Peça PCM cru ao TTS** (a partir do M1): ElevenLabs `pcm_24000`, OpenAI `response_format="pcm"`, Azure `Raw24Khz16BitMonoPcm`. Remove o decoder de MP3 do caminho crítico e a dependência de `ffmpeg`.
+- **Formatos fixos:** captura 16 kHz mono PCM16. Se o dispositivo recusar essa taxa, capture na nativa dele e converta **no cliente** — nunca no core.
+- **Captura em thread separada** alimentando o event loop por fila: o callback do PortAudio bloqueia e não pode competir com o asyncio.
 
-**Risco honesto: o microfone integrado do PC é a peça mais fraca do sistema.** Array de notebook é ruidoso e capta longe. Se a transcrição vier errada, a causa provável é o microfone, não o modelo de STT — troque de provider por último, não primeiro. Mitigações que custam zero: normalizar ganho antes de enviar, cortar silêncio nas pontas, e falar a ~30 cm do aparelho.
+**Sobre a qualidade do microfone:** o array de três microfones do MacBook é dos melhores integrados que existem — este risco é bem menor no Mac do que num PC genérico, e a v2 deste documento foi pessimista demais aqui. Ainda assim meça no M0, e conheça o botão: o Modo de Microfone do macOS (Central de Controle, durante uma captura ativa) alterna entre Padrão, Isolamento de Voz e Espectro Amplo. Isolamento de Voz ajuda em ambiente barulhento e atrapalha se você quiser captar mais do que a própria voz.
 
 ---
 
@@ -404,7 +406,7 @@ A separação entre persona e memória continua sendo a mesma decisão da v1, e 
 # config/profiles/default.yaml
 ptt:  {backend: pynput, key: ctrl+space, mode: hold}   # hold | toggle
 audio:
-  input_device: null        # null = default do Windows; fixe o índice depois
+  input_device: null        # null = default do sistema; fixe o índice depois
   output_device: null
 stt:  {provider: groq, model: whisper-large-v3-turbo, language: pt}
 llm:
@@ -450,7 +452,7 @@ Um pacote, duas camadas conceituais (`client/` e o resto). Não quebre em reposi
 
 | Marco | Entrega | O que prova |
 |---|---|---|
-| **M0** | Hotkey + captura + playback + `TurnTrace`, gravando e tocando de volta | O stack de áudio funciona no seu Windows, com o seu microfone |
+| **M0** | Hotkey + captura + playback + `TurnTrace`, gravando e tocando de volta | O stack de áudio funciona no seu Mac, com o seu microfone |
 | **M1** | STT → LLM → TTS streaming ponta a ponta | **É o MVP. Aqui você sente a latência e a voz reais e decide se o caminho vale.** |
 | **M2** | Barge-in, chunking afinado, tratamento de erro, persona, tools triviais | Deixa de ser demo e vira algo que você usa todo dia |
 | **M3** | Memória em SQLite, extração em background, tools `lembrar`/`esquecer` | A EVE passa a te conhecer |
