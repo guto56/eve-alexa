@@ -237,6 +237,21 @@ Comparado com a v1 (0,8–1,5 s), o teto piorou um pouco: o STT batch substitui 
 
 Cada provider declara suas capacidades (`supports_streaming`, `languages`, `output_formats`) para o orquestrador degradar em vez de quebrar.
 
+### O mínimo de contas que você precisa abrir
+
+Você tem OpenRouter. **OpenRouter é só LLM** — não faz STT nem TTS. Faltam, portanto, duas contas:
+
+| Camada | Opção | Fricção do cadastro | Custo |
+|---|---|---|---|
+| STT | **Groq** | signup grátis, sem cartão | free tier cobre uso pessoal; ~US$ 0,10/mês se passar |
+| TTS | **Azure Speech** | exige cartão para verificação (o tier grátis não cobra) | 500 mil caracteres/mês grátis |
+| TTS — alternativa sem conta | `edge-tts` | nenhuma | zero |
+
+Sobre o `edge-tts`: é um pacote Python que usa as mesmas vozes neurais da Microsoft (`pt-BR-FranciscaNeural` e companhia) pelo endpoint do recurso de leitura em voz alta do Edge. Funciona, transmite em streaming, e não pede conta nem chave. **É não-oficial**: sem SLA, sem garantia de disponibilidade, pode quebrar sem aviso. Para o M1 — cujo objetivo declarado é descobrir se a experiência é boa — é um atalho legítimo e honesto. Se a EVE virar algo que você usa de verdade, migrar para o Azure oficial é uma linha de configuração.
+
+Detalhe útil para a §11: **o ElevenLabs tem free tier de ~10 mil caracteres/mês.** Não serve para uso diário, mas serve exatamente para o A/B de voz — você compara a voz cara com a barata sem pagar nada, e só decide assinar se a diferença for grande o bastante para importar.
+
+
 ---
 
 ## 11. A tensão real: "voz natural" × "gastar o mínimo"
